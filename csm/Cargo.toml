@@ -1,0 +1,8 @@
+[package]
+name = "csm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+csm_macros = { path = "../csm_macros" }
+
