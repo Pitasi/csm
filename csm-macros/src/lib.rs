@@ -15,36 +15,34 @@ pub fn csm(tokens: TokenStream) -> TokenStream {
 fn csm_impl(input: TokenStream) -> TokenStream {
     let rules = parse_macro_input!(input as Rules);
 
-    let class_names = rules
-        .0
-        .iter()
-        .map(|rule| rule.class_name())
-        .collect::<Vec<String>>()
-        .join(" ");
-
-    let css = rules
-        .0
-        .iter()
-        .map(|rule| rule.to_css_class())
-        .collect::<Vec<String>>()
-        .join("\n");
+    let css = rules.0.iter().map(|(_, rule)| {
+        let class_name = rule.class_name();
+        let css = rule.to_css_class();
+        quote! { (#class_name, #css) }
+    });
 
     quote! {{
-        (#class_names, #css)
+        [#(#css),*]
     }}
     .into()
 }
 
 #[derive(Clone, Debug)]
-struct Rules(Vec<Rule>);
+struct Rules(HashMap<String, Rule>);
 
 impl Parse for Rules {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let mut rules = Vec::new();
+        let mut rules = HashMap::new();
         while !input.is_empty() {
-            rules.push(input.parse::<Rule>()?);
-            if input.is_empty() {
-                break;
+            let rule = input.parse::<Rule>()?;
+            let name = rule.prop.clone();
+            match rules.insert(name, rule) {
+                Some(dup_rule) => {
+                    return Err(
+                        input.error(format!("duplicate rule for property `{}`", dup_rule.prop,))
+                    );
+                }
+                None => {}
             }
         }
         Ok(Rules(rules))
@@ -54,8 +52,8 @@ impl Parse for Rules {
 impl Rules {
     fn merge(&self, other: &Rules) -> Rules {
         let mut rules = self.0.clone();
-        for rule in &other.0 {
-            rules.push(rule.clone());
+        for (_, rule) in &other.0 {
+            rules.insert(rule.prop.clone(), rule.clone());
         }
         Rules(rules)
     }
@@ -310,42 +308,6 @@ pub fn recipe(tokens: TokenStream) -> TokenStream {
 fn recipe_impl(input: TokenStream) -> TokenStream {
     let recipe = parse_macro_input!(input as Recipe);
 
-    // let mut rules = recipe.base.0.clone();
-    //
-    // for (name, variant) in &recipe.variants {
-    //     if let Some(variant_rules) = variant.0.clone() {
-    //         for rule in variant_rules {
-    //             rules.push(rule);
-    //         }
-    //     }
-    // }
-    //
-    // let mut css = String::new();
-    //
-    // for rule in rules {
-    //     css.push_str(rule.to_css().as_str());
-    //     css.push_str("\n");
-    // }
-    //
-    // let mut defaults = HashMap::new();
-    //
-    // for (name, default) in &recipe.defaults {
-    //     defaults.insert(name.clone(), default.clone());
-    // }
-    //
-    // quote! {{
-    //     (#css, #defaults)
-    // }}
-    // .into()
-
-    // variants = [a=1,2,  b=1,2,  c=1]
-    // matrix = [
-    //            [a=1,    b=1,    c=1],
-    //            [a=1,    b=2,    c=1],
-    //            [a=2,    b=1,    c=1],
-    //            [a=2,    b=2,    c=1],
-    //          ]
-
     let mut matrix = vec![vec![]];
     for (_, variant) in &recipe.variants {
         let mut new_rows = Vec::new();
@@ -359,18 +321,7 @@ fn recipe_impl(input: TokenStream) -> TokenStream {
         matrix = new_rows;
     }
 
-    eprintln!("{:?}", matrix);
-
     let macro_name = &recipe.name;
-    // quote! {
-    //     macro_rules! #macro_name {
-    //         #(
-    //             (#(#matrix),*) => {
-    //                 "heh";
-    //             }
-    //         )*
-    //     }
-    // }
 
     let mut m_rules = vec![];
     for row in matrix {
@@ -392,7 +343,7 @@ fn recipe_impl(input: TokenStream) -> TokenStream {
             ".{} {{\n{}\n}}",
             class_name,
             r.0.iter()
-                .map(|rule| rule.to_css())
+                .map(|(_, rule)| rule.to_css())
                 .collect::<Vec<String>>()
                 .join("\n")
         );
@@ -401,10 +352,6 @@ fn recipe_impl(input: TokenStream) -> TokenStream {
                 (#class_name, #css)
             };
         });
-    }
-
-    for x in &m_rules {
-        eprintln!("{}", x);
     }
 
     quote! {
