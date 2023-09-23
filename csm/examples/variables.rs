@@ -1,27 +1,33 @@
 use csm::{csm, csm_defs};
 
 fn main() {
-    // csm_defs is a convenient way to define CSS variables
-    let css = csm_defs! {
+    // csm_defs is a convenient way to define CSS variables for :root
+    csm_defs! {
         // define a new variable called red
         red: #FF0000,
 
         // dollar sign is used to reference a CSS variable
         danger: $red,
     };
-    // this will expand into:
-    // let css = ":root {--red: #FF0000;--danger: var(--red);}";
-    println!("{:?}", css);
 
-    // then, variables can be used in normal csm macro calls:
-    let css2 = csm! {
-        color: $red,
+    // then, variables can be used in normal csm!{} calls:
+    let css = csm! { some_id,
+        color: $danger,
     };
-    // this will expand into:
-    // let css2 = [("color_red", ".color_red { color: var(--red); }")];
-    println!("{:?}", css2);
+    println!("{:?}", css);
+    // -> "color_danger"
 
-    // note that csm and csm_defs do not keep any internal state, they expand
-    // dollar signs into var(--var_name) but there's no guarantee that the
-    // variable was defined before
+    // and the CSS bundle will contain:
+    //
+    // .color_danger {
+    //   color: var(--danger);
+    // }
+    //
+    // :root {
+    //   --danger: var(--red);
+    //   --red: red;
+    // }
+
+    // note that when using $danger, it gets expanded to var(--danger), but there's no guarantee
+    // that --danger is defined (i.e. you won't get a compile time error)
 }

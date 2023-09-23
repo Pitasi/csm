@@ -1,30 +1,113 @@
 extern crate proc_macro;
-use std::collections::HashMap;
+use std::{collections::HashMap, fs, io::Write, path::Path};
 
+use lightningcss::{
+    bundler::{Bundler, FileProvider},
+    stylesheet::{MinifyOptions, ParserOptions, PrinterOptions},
+};
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
-use syn::{braced, parse::Parse, parse_macro_input};
+use syn::{parse::Parse, parse_macro_input};
+
+const OUTPUT_DIR: &str = "./target/csm";
+
+fn write(path: &Path, def: &str) {
+    let mut f = fs::File::create(path).expect("failed to create file");
+    f.write(def.as_bytes()).expect("failed to write file");
+}
+
+fn write_bundle(path: &Path) {
+    let abs_out = std::fs::canonicalize(path).unwrap();
+
+    let mut bundle =
+        fs::File::create(abs_out.join("bundle.tmp.css")).expect("failed to create file");
+    let files = fs::read_dir(abs_out.join("css")).expect("failed to read dir");
+    for file in files.filter_map(|file| file.ok()) {
+        let modified = file
+            .metadata()
+            .expect("failed to read metadata")
+            .modified()
+            .expect("failed to read access time");
+        let is_old = modified
+            .elapsed()
+            .expect("failed to read elapsed time")
+            .gt(&std::time::Duration::from_secs(60 * 60 * 24));
+        if is_old {
+            eprintln!("WARN: {} not being used in a while, consider manually deleting it or it will end up in your bundle. If this is a mistake please open an issue on GitHub.", file.path().to_str().unwrap());
+        }
+
+        bundle
+            .write_fmt(format_args!(
+                "@import \"{}\";\n",
+                file.path().to_str().unwrap()
+            ))
+            .expect("failed to write file");
+    }
+
+    let fp = FileProvider::new();
+    let mut res = Bundler::new(&fp, None, ParserOptions::default())
+        .bundle(&abs_out.join("bundle.tmp.css"))
+        .expect("failed to bundle");
+    res.minify(MinifyOptions::default())
+        .expect("failed to minify");
+    let final_bundle = res
+        .to_css(PrinterOptions {
+            #[cfg(feature = "minify")]
+            minify: true,
+            ..Default::default()
+        })
+        .expect("failed to print")
+        .code;
+
+    write(&abs_out.join("bundle.css"), &final_bundle);
+
+    //fs::remove_file(path.join("bundle.tmp.css")).expect("failed to remove file");
+}
 
 #[proc_macro]
 pub fn csm(tokens: TokenStream) -> TokenStream {
-    //let tokens: proc_macro2::TokenStream = tokens.into();
-    csm_impl(tokens)
+    let csm = parse_macro_input!(tokens as Csm);
+
+    // write file
+    let out_dir = Path::new(OUTPUT_DIR);
+    fs::create_dir_all(out_dir.join("css")).expect("failed to create dir");
+    let out_file = out_dir.join("css").join(format!("{}.css", csm.id));
+    let css = csm
+        .rules
+        .0
+        .iter()
+        .map(|(_, rule)| rule.to_css_class())
+        .collect::<Vec<_>>()
+        .join("\n");
+    write(Path::new(&out_file), &css);
+
+    write_bundle(out_dir);
+
+    // output list of classes
+    let classes = csm
+        .rules
+        .0
+        .iter()
+        .map(|(_, rule)| rule.class_name())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    quote! { #classes }.into()
 }
 
-fn csm_impl(input: TokenStream) -> TokenStream {
-    let rules = parse_macro_input!(input as Rules);
+struct Csm {
+    id: syn::Ident,
+    rules: Rules,
+}
 
-    let css = rules.0.iter().map(|(_, rule)| {
-        let class_name = rule.class_name();
-        let css = rule.to_css_class();
-        quote! { (#class_name, #css) }
-    });
-
-    quote! {{
-        [#(#css),*]
-    }}
-    .into()
+impl Parse for Csm {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let id = input.parse::<syn::Ident>()?;
+        input.parse::<syn::Token![,]>()?;
+        let rules = input.parse::<Rules>()?;
+        Ok(Csm { id, rules })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,15 +132,15 @@ impl Parse for Rules {
     }
 }
 
-impl Rules {
-    fn merge(&self, other: &Rules) -> Rules {
-        let mut rules = self.0.clone();
-        for (_, rule) in &other.0 {
-            rules.insert(rule.prop.clone(), rule.clone());
-        }
-        Rules(rules)
-    }
-}
+// impl Rules {
+//     fn merge(&self, other: &Rules) -> Rules {
+//         let mut rules = self.0.clone();
+//         for (_, rule) in &other.0 {
+//             rules.insert(rule.prop.clone(), rule.clone());
+//         }
+//         Rules(rules)
+//     }
+// }
 
 #[derive(Clone, Debug)]
 struct Rule {
@@ -207,12 +290,15 @@ pub fn csm_defs(tokens: TokenStream) -> TokenStream {
 fn csm_colors_impl(input: TokenStream) -> TokenStream {
     let defs = parse_macro_input!(input as TokenDefs);
 
-    let css = defs.to_css();
+    // write file
+    let out_dir = Path::new(OUTPUT_DIR);
+    fs::create_dir_all(out_dir.join("css")).expect("failed to create dir");
+    let out_file = out_dir.join("css").join("_csm_defs.css");
+    write(Path::new(&out_file), &defs.to_css());
 
-    quote! {{
-        #css
-    }}
-    .into()
+    write_bundle(out_dir);
+
+    quote! {}.into()
 }
 
 #[derive(Debug)]
@@ -281,7 +367,6 @@ impl Parse for TokenDef {
             // var reference
             let ident = input.parse::<syn::Ident>()?;
             value.push_str(format!("var(--{})", ident.to_string()).as_str());
-            input.parse::<syn::Token![,]>()?;
         } else {
             while !input.is_empty() && !input.peek(syn::Token![,]) {
                 input.parse::<syn::Token![#]>()?;
@@ -290,152 +375,154 @@ impl Parse for TokenDef {
                 let ident = input.parse::<syn::Ident>()?;
                 value.push_str(ident.to_string().as_str());
             }
+        }
 
-            if input.peek(syn::Token![,]) {
-                input.parse::<syn::Token![,]>()?;
-            }
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
         }
 
         Ok(TokenDef { name, value })
     }
 }
 
-#[proc_macro]
-pub fn recipe(tokens: TokenStream) -> TokenStream {
-    recipe_impl(tokens)
-}
+// TODO: recipe!{} macro should be rethinked entirely.
 
-fn recipe_impl(input: TokenStream) -> TokenStream {
-    let recipe = parse_macro_input!(input as Recipe);
-
-    let mut matrix = vec![vec![]];
-    for (_, variant) in &recipe.variants {
-        let mut new_rows = Vec::new();
-        for row in &matrix {
-            for (variant_choice, variant_rules) in variant {
-                let mut new_row = row.clone();
-                new_row.push((variant_choice.clone(), variant_rules));
-                new_rows.push(new_row);
-            }
-        }
-        matrix = new_rows;
-    }
-
-    let macro_name = &recipe.name;
-
-    let mut m_rules = vec![];
-    for row in matrix {
-        let names = row.iter().map(|(name, _)| name).collect::<Vec<_>>();
-        let mut r = recipe.base.clone();
-        for (_, rules) in &row {
-            r = r.merge(rules);
-        }
-        let class_name = format!(
-            "{}__{}",
-            &recipe.name,
-            names
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()
-                .join("_")
-        );
-        let css = format!(
-            ".{} {{\n{}\n}}",
-            class_name,
-            r.0.iter()
-                .map(|(_, rule)| rule.to_css())
-                .collect::<Vec<String>>()
-                .join("\n")
-        );
-        m_rules.push(quote! {
-            (#(#names),*) => {
-                (#class_name, #css)
-            };
-        });
-    }
-
-    quote! {
-        macro_rules! #macro_name {
-            #(#m_rules)*
-        }
-    }
-    .into()
-}
-
-#[derive(Debug)]
-struct Recipe {
-    name: syn::Ident,
-    base: Rules,
-    variants: Vec<(String, HashMap<String, Rules>)>,
-    defaults: Vec<(String, String)>,
-}
-
-impl Parse for Recipe {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let name = input.parse::<syn::Ident>()?;
-        let mut base = None;
-        let mut variants = vec![];
-        let mut defaults = vec![];
-
-        while !input.is_empty() {
-            if input.peek(syn::Ident) {
-                let ident = input.parse::<syn::Ident>()?;
-                input.parse::<syn::Token![:]>()?;
-                let body;
-                braced!(body in input);
-
-                if ident.to_string() == "base" {
-                    base = Some(body.parse::<Rules>()?);
-                } else if ident.to_string() == "default" {
-                    let ident = body.parse::<syn::Ident>()?;
-                    defaults.push(("default".to_string(), ident.to_string()));
-                } else if ident.to_string() == "variants" {
-                    while !body.is_empty() {
-                        let variant_name = body.parse::<syn::Ident>()?;
-                        body.parse::<syn::Token![:]>()?;
-                        let variant_body;
-                        braced!(variant_body in body);
-
-                        let mut variant_choices = HashMap::new();
-
-                        while !variant_body.is_empty() {
-                            let ident = variant_body.parse::<syn::Ident>()?;
-                            variant_body.parse::<syn::Token![:]>()?;
-                            let choice_body;
-                            braced!(choice_body in variant_body);
-                            variant_choices
-                                .insert(ident.to_string(), choice_body.parse::<Rules>()?);
-                            if variant_body.peek(syn::Token![,]) {
-                                variant_body.parse::<syn::Token![,]>()?;
-                            }
-                        }
-
-                        variants.push((variant_name.to_string(), variant_choices));
-                        if body.peek(syn::Token![,]) {
-                            body.parse::<syn::Token![,]>()?;
-                        }
-                    }
-                } else {
-                    return Err(syn::Error::new(
-                        Span::call_site(),
-                        format!(
-                            "expected base, variants, or default, got: `{}`",
-                            ident.to_string()
-                        ),
-                    ));
-                }
-            } else if input.peek(syn::Token![,]) {
-                input.parse::<syn::Token![,]>()?;
-            } else {
-                return Err(input.error("unexpected token"));
-            }
-        }
-
-        Ok(Recipe {
-            name,
-            base: base.expect("base is required"),
-            variants,
-            defaults,
-        })
-    }
-}
+// #[proc_macro]
+// pub fn recipe(tokens: TokenStream) -> TokenStream {
+//     recipe_impl(tokens)
+// }
+//
+// fn recipe_impl(input: TokenStream) -> TokenStream {
+//     let recipe = parse_macro_input!(input as Recipe);
+//
+//     let mut matrix = vec![vec![]];
+//     for (_, variant) in &recipe.variants {
+//         let mut new_rows = Vec::new();
+//         for row in &matrix {
+//             for (variant_choice, variant_rules) in variant {
+//                 let mut new_row = row.clone();
+//                 new_row.push((variant_choice.clone(), variant_rules));
+//                 new_rows.push(new_row);
+//             }
+//         }
+//         matrix = new_rows;
+//     }
+//
+//     let macro_name = &recipe.name;
+//
+//     let mut m_rules = vec![];
+//     for row in matrix {
+//         let names = row.iter().map(|(name, _)| name).collect::<Vec<_>>();
+//         let mut r = recipe.base.clone();
+//         for (_, rules) in &row {
+//             r = r.merge(rules);
+//         }
+//         let class_name = format!(
+//             "{}__{}",
+//             &recipe.name,
+//             names
+//                 .iter()
+//                 .map(|s| s.to_string())
+//                 .collect::<Vec<String>>()
+//                 .join("_")
+//         );
+//         let css = format!(
+//             ".{} {{\n{}\n}}",
+//             class_name,
+//             r.0.iter()
+//                 .map(|(_, rule)| rule.to_css())
+//                 .collect::<Vec<String>>()
+//                 .join("\n")
+//         );
+//         m_rules.push(quote! {
+//             (#(#names),*) => {
+//                 (#class_name, #css)
+//             };
+//         });
+//     }
+//
+//     quote! {
+//         macro_rules! #macro_name {
+//             #(#m_rules)*
+//         }
+//     }
+//     .into()
+// }
+//
+// #[derive(Debug)]
+// struct Recipe {
+//     name: syn::Ident,
+//     base: Rules,
+//     variants: Vec<(String, HashMap<String, Rules>)>,
+//     defaults: Vec<(String, String)>,
+// }
+//
+// impl Parse for Recipe {
+//     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+//         let name = input.parse::<syn::Ident>()?;
+//         let mut base = None;
+//         let mut variants = vec![];
+//         let mut defaults = vec![];
+//
+//         while !input.is_empty() {
+//             if input.peek(syn::Ident) {
+//                 let ident = input.parse::<syn::Ident>()?;
+//                 input.parse::<syn::Token![:]>()?;
+//                 let body;
+//                 braced!(body in input);
+//
+//                 if ident.to_string() == "base" {
+//                     base = Some(body.parse::<Rules>()?);
+//                 } else if ident.to_string() == "default" {
+//                     let ident = body.parse::<syn::Ident>()?;
+//                     defaults.push(("default".to_string(), ident.to_string()));
+//                 } else if ident.to_string() == "variants" {
+//                     while !body.is_empty() {
+//                         let variant_name = body.parse::<syn::Ident>()?;
+//                         body.parse::<syn::Token![:]>()?;
+//                         let variant_body;
+//                         braced!(variant_body in body);
+//
+//                         let mut variant_choices = HashMap::new();
+//
+//                         while !variant_body.is_empty() {
+//                             let ident = variant_body.parse::<syn::Ident>()?;
+//                             variant_body.parse::<syn::Token![:]>()?;
+//                             let choice_body;
+//                             braced!(choice_body in variant_body);
+//                             variant_choices
+//                                 .insert(ident.to_string(), choice_body.parse::<Rules>()?);
+//                             if variant_body.peek(syn::Token![,]) {
+//                                 variant_body.parse::<syn::Token![,]>()?;
+//                             }
+//                         }
+//
+//                         variants.push((variant_name.to_string(), variant_choices));
+//                         if body.peek(syn::Token![,]) {
+//                             body.parse::<syn::Token![,]>()?;
+//                         }
+//                     }
+//                 } else {
+//                     return Err(syn::Error::new(
+//                         Span::call_site(),
+//                         format!(
+//                             "expected base, variants, or default, got: `{}`",
+//                             ident.to_string()
+//                         ),
+//                     ));
+//                 }
+//             } else if input.peek(syn::Token![,]) {
+//                 input.parse::<syn::Token![,]>()?;
+//             } else {
+//                 return Err(input.error("unexpected token"));
+//             }
+//         }
+//
+//         Ok(Recipe {
+//             name,
+//             base: base.expect("base is required"),
+//             variants,
+//             defaults,
+//         })
+//     }
+// }

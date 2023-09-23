@@ -7,5 +7,5 @@ edition = "2021"
 csm-macros = { path = "../csm-macros" }
 
 [dev-dependencies]
-rscx = { version = "0.1.2" }
+rscx = { version = "0.1.9" }
 tokio = { version = "1.13.0", features = ["full"] }
